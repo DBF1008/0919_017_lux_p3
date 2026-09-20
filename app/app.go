@@ -7,6 +7,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/fatih/color"
 	"github.com/urfave/cli/v2"
@@ -162,6 +163,21 @@ func New() *cli.App {
 				Value:   10,
 				Usage:   "The number of download thread (only works for multiple-parts video)",
 			},
+			&cli.UintFlag{
+				Name:  "max-concurrent",
+				Value: 3,
+				Usage: "The maximum number of concurrent download tasks",
+			},
+			&cli.UintFlag{
+				Name:  "queue-retry",
+				Value: 2,
+				Usage: "How many times a failed task is rescheduled by the download queue (task-level retry, unlike --retry which retries inside a single task)",
+			},
+			&cli.UintFlag{
+				Name:  "queue-retry-delay",
+				Value: 5,
+				Usage: "Delay in seconds before a failed task is rescheduled by the download queue",
+			},
 
 			// Aria2
 			&cli.BoolFlag{
@@ -252,19 +268,30 @@ func New() *cli.App {
 				Silent:     c.Bool("silent"),
 			})
 
-			var isErr bool
-			for _, videoURL := range args {
-				if err := download(c, videoURL); err != nil {
-					fmt.Fprintf(
-						color.Output,
-						"Downloading %s error:\n",
-						color.CyanString("%s", videoURL),
-					)
-					fmt.Printf("%+v\n", err)
-					isErr = true
+			var systemErrors []error
+			var taskErrors []downloader.TaskError
+			if c.Bool("json") {
+				for _, videoURL := range args {
+					if err := printJSON(c, videoURL); err != nil {
+						printExtractError(videoURL, err)
+						systemErrors = append(systemErrors, err)
+					}
 				}
+			} else {
+				taskErrors, systemErrors = downloadWithQueue(c, args)
 			}
-			if isErr {
+			for _, taskErr := range taskErrors {
+				fmt.Fprintf(
+					color.Output,
+					"Downloading %s error (task-level, retries exhausted):\n",
+					color.CyanString("%s", taskErr.Task.Data.URL),
+				)
+				fmt.Printf("%+v\n", taskErr.Err)
+			}
+			for _, err := range systemErrors {
+				fmt.Printf("%+v\n", err)
+			}
+			if len(taskErrors) != 0 || len(systemErrors) != 0 {
 				return cli.Exit("", 1)
 			}
 			return nil
@@ -276,8 +303,28 @@ func New() *cli.App {
 	return app
 }
 
-func download(c *cli.Context, videoURL string) error {
-	data, err := extractors.Extract(videoURL, extractors.Options{
+func printExtractError(videoURL string, err error) {
+	fmt.Fprintf(
+		color.Output,
+		"Extracting %s error:\n",
+		color.CyanString("%s", videoURL),
+	)
+	fmt.Printf("%+v\n", err)
+}
+
+func printJSON(c *cli.Context, videoURL string) error {
+	data, err := extract(c, videoURL)
+	if err != nil {
+		return err
+	}
+	e := json.NewEncoder(os.Stdout)
+	e.SetIndent("", "\t")
+	e.SetEscapeHTML(false)
+	return e.Encode(data)
+}
+
+func extract(c *cli.Context, videoURL string) ([]*extractors.Data, error) {
+	return extractors.Extract(videoURL, extractors.Options{
 		Playlist:         c.Bool("playlist"),
 		Items:            c.String("items"),
 		ItemStart:        int(c.Uint("start")),
@@ -289,24 +336,41 @@ func download(c *cli.Context, videoURL string) error {
 		YoukuCkey:        c.String("youku-ckey"),
 		YoukuPassword:    c.String("youku-password"),
 	})
-	if err != nil {
-		// if this error occurs, it means that an error occurred before actually starting to extract data
-		// (there is an error in the preparation step), and the data list is empty.
-		return err
-	}
+}
 
-	if c.Bool("json") {
-		e := json.NewEncoder(os.Stdout)
-		e.SetIndent("", "\t")
-		e.SetEscapeHTML(false)
-		if err := e.Encode(data); err != nil {
-			return err
+// downloadWithQueue extracts all URLs, puts the extracted data into the
+// download queue and runs the queue with a global concurrency limit.
+// It returns task-level errors (a task failed after all task-level retries)
+// and system-level errors (extraction/preparation failures) separately.
+func downloadWithQueue(c *cli.Context, args []string) ([]downloader.TaskError, []error) {
+	queueManager := downloader.NewQueueManager(downloader.QueueOptions{
+		MaxConcurrent:  int(c.Uint("max-concurrent")),
+		MaxTaskRetries: int(c.Uint("queue-retry")),
+		RetryDelay:     time.Duration(c.Uint("queue-retry-delay")) * time.Second,
+	})
+
+	// system-level errors: an error occurred before actually starting to
+	// download (there is an error in the preparation/extraction step).
+	systemErrors := make([]error, 0)
+	for _, videoURL := range args {
+		data, err := extract(c, videoURL)
+		if err != nil {
+			printExtractError(videoURL, err)
+			systemErrors = append(systemErrors, err)
+			continue
 		}
-
-		return nil
+		for _, item := range data {
+			if item.Err != nil {
+				// the preparation step is normal, but the data extraction is
+				// wrong, the data is an empty struct.
+				systemErrors = append(systemErrors, item.Err)
+				continue
+			}
+			queueManager.Add(item, 0)
+		}
 	}
 
-	defaultDownloader := downloader.New(downloader.Options{
+	options := downloader.Options{
 		Silent:         c.Bool("silent"),
 		InfoOnly:       c.Bool("info"),
 		Stream:         c.String("stream-format"),
@@ -325,21 +389,13 @@ func download(c *cli.Context, videoURL string) error {
 		Aria2Token:     c.String("aria2-token"),
 		Aria2Method:    c.String("aria2-method"),
 		Aria2Addr:      c.String("aria2-addr"),
+	}
+	result := queueManager.Run(func(task *downloader.Task) error {
+		// build a new Downloader per task: Downloader keeps per-download
+		// state (eg: the progress bar) and is not safe for concurrent use.
+		taskOptions := options
+		taskOptions.PauseController = task.PauseController()
+		return downloader.New(taskOptions).Download(task.Data)
 	})
-	errors := make([]error, 0)
-	for _, item := range data {
-		if item.Err != nil {
-			// if this error occurs, the preparation step is normal, but the data extraction is wrong.
-			// the data is an empty struct.
-			errors = append(errors, item.Err)
-			continue
-		}
-		if err = defaultDownloader.Download(item); err != nil {
-			errors = append(errors, err)
-		}
-	}
-	if len(errors) != 0 {
-		return errors[0]
-	}
-	return nil
+	return result.TaskErrors, append(systemErrors, result.SystemErrors...)
 }

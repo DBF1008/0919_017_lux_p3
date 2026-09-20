@@ -41,6 +41,9 @@ type Options struct {
 	ThreadNumber int
 	RetryTimes   int
 	ChunkSizeMB  int
+	// PauseController, if not nil, allows pausing/resuming the download
+	// at chunk boundaries (used by the download queue manager).
+	PauseController *PauseController
 	// Aria2
 	UseAria2RPC bool
 	Aria2Token  string
@@ -72,6 +75,13 @@ func New(option Options) *Downloader {
 		option: option,
 	}
 	return downloader
+}
+
+// waitIfPaused blocks while the bound PauseController is paused.
+func (downloader *Downloader) waitIfPaused() {
+	if downloader.option.PauseController != nil {
+		downloader.option.PauseController.Wait()
+	}
 }
 
 // caption downloads danmaku, subtitles, etc
@@ -189,6 +199,7 @@ func (downloader *Downloader) save(part *extractors.Part, refer, fileName string
 		}
 		var i int64 = 1
 		for ; i <= chunk; i++ {
+			downloader.waitIfPaused()
 			end = start + chunkSize - 1
 			headers["Range"] = fmt.Sprintf("bytes=%d-%d", start, end)
 			temp := start
@@ -208,6 +219,7 @@ func (downloader *Downloader) save(part *extractors.Part, refer, fileName string
 	} else {
 		temp := tempFileSize
 		for i := 0; ; i++ {
+			downloader.waitIfPaused()
 			written, err := downloader.writeFile(part.URL, file, headers)
 			if err == nil {
 				break
@@ -376,6 +388,7 @@ func (downloader *Downloader) multiThreadSave(dataPart *extractors.Part, refer, 
 				}
 			}
 			for remainingSize > 0 {
+				downloader.waitIfPaused()
 				end = computeEnd(part.Cur, chunkSize, part.End)
 				headers["Range"] = fmt.Sprintf("bytes=%d-%d", part.Cur, end)
 				temp := part.Cur
