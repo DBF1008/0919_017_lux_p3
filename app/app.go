@@ -1,12 +1,14 @@
 package app
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/fatih/color"
 	"github.com/urfave/cli/v2"
@@ -30,8 +32,8 @@ func init() {
 		fmt.Fprintf(
 			color.Output,
 			"\n%s: version %s, A fast and simple video downloader.\n\n",
-			cyan.Sprintf(Name),
-			blue.Sprintf(c.App.Version),
+			cyan.Sprintf("%s", Name),
+			blue.Sprintf("%s", c.App.Version),
 		)
 	}
 }
@@ -163,6 +165,28 @@ func New() *cli.App {
 				Usage:   "The number of download thread (only works for multiple-parts video)",
 			},
 
+			// Download queue
+			&cli.UintFlag{
+				Name:  "max-concurrent",
+				Value: 3,
+				Usage: "The maximum number of videos downloaded concurrently (global limit)",
+			},
+			&cli.IntFlag{
+				Name:  "priority",
+				Value: 0,
+				Usage: "User-specified scheduling priority for the input URLs, higher values are downloaded first",
+			},
+			&cli.UintFlag{
+				Name:  "queue-retry",
+				Value: 2,
+				Usage: "How many times a failed task is re-scheduled by the download queue (task-level retry)",
+			},
+			&cli.UintFlag{
+				Name:  "queue-retry-delay",
+				Value: 5,
+				Usage: "Base delay in seconds before a failed task is re-scheduled by the download queue",
+			},
+
 			// Aria2
 			&cli.BoolFlag{
 				Name:  "aria2",
@@ -252,22 +276,23 @@ func New() *cli.App {
 				Silent:     c.Bool("silent"),
 			})
 
-			var isErr bool
-			for _, videoURL := range args {
-				if err := download(c, videoURL); err != nil {
-					fmt.Fprintf(
-						color.Output,
-						"Downloading %s error:\n",
-						color.CyanString("%s", videoURL),
-					)
-					fmt.Printf("%+v\n", err)
-					isErr = true
+			// The info and json modes only print the extracted data, keep the
+			// original serial behavior for them.
+			if c.Bool("info") || c.Bool("json") {
+				var isErr bool
+				for _, videoURL := range args {
+					if err := printData(c, videoURL); err != nil {
+						printTaskError(videoURL, err)
+						isErr = true
+					}
 				}
+				if isErr {
+					return cli.Exit("", 1)
+				}
+				return nil
 			}
-			if isErr {
-				return cli.Exit("", 1)
-			}
-			return nil
+
+			return downloadWithQueue(c, args)
 		},
 		EnableBashCompletion: true,
 	}
@@ -276,7 +301,18 @@ func New() *cli.App {
 	return app
 }
 
-func download(c *cli.Context, videoURL string) error {
+func printTaskError(videoURL string, err error) {
+	fmt.Fprintf(
+		color.Output,
+		"Downloading %s error:\n",
+		color.CyanString("%s", videoURL),
+	)
+	fmt.Printf("%+v\n", err)
+}
+
+// extract extracts the data of one URL. A returned error is a task-level
+// failure of this URL.
+func extract(c *cli.Context, videoURL string) ([]*extractors.Data, error) {
 	data, err := extractors.Extract(videoURL, extractors.Options{
 		Playlist:         c.Bool("playlist"),
 		Items:            c.String("items"),
@@ -292,9 +328,17 @@ func download(c *cli.Context, videoURL string) error {
 	if err != nil {
 		// if this error occurs, it means that an error occurred before actually starting to extract data
 		// (there is an error in the preparation step), and the data list is empty.
+		return nil, err
+	}
+	return data, nil
+}
+
+// printData handles the --info and --json modes for one URL.
+func printData(c *cli.Context, videoURL string) error {
+	data, err := extract(c, videoURL)
+	if err != nil {
 		return err
 	}
-
 	if c.Bool("json") {
 		e := json.NewEncoder(os.Stdout)
 		e.SetIndent("", "\t")
@@ -306,7 +350,30 @@ func download(c *cli.Context, videoURL string) error {
 		return nil
 	}
 
-	defaultDownloader := downloader.New(downloader.Options{
+	defaultDownloader := newDownloader(c, nil)
+	errs := make([]error, 0)
+	for _, item := range data {
+		if item.Err != nil {
+			// if this error occurs, the preparation step is normal, but the data extraction is wrong.
+			// the data is an empty struct.
+			errs = append(errs, item.Err)
+			continue
+		}
+		if err = defaultDownloader.Download(item); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if len(errs) != 0 {
+		return errs[0]
+	}
+	return nil
+}
+
+// newDownloader builds a Downloader from the CLI context. If pause is not
+// nil, it is attached to the downloader so the queue manager can pause and
+// resume this download.
+func newDownloader(c *cli.Context, pause *downloader.PauseController) *downloader.Downloader {
+	return downloader.New(downloader.Options{
 		Silent:         c.Bool("silent"),
 		InfoOnly:       c.Bool("info"),
 		Stream:         c.String("stream-format"),
@@ -325,21 +392,157 @@ func download(c *cli.Context, videoURL string) error {
 		Aria2Token:     c.String("aria2-token"),
 		Aria2Method:    c.String("aria2-method"),
 		Aria2Addr:      c.String("aria2-addr"),
+		// PauseController is managed by the download queue manager and allows
+		// pausing/resuming this download at chunk boundaries.
+		PauseController: pause,
 	})
-	errors := make([]error, 0)
-	for _, item := range data {
-		if item.Err != nil {
-			// if this error occurs, the preparation step is normal, but the data extraction is wrong.
-			// the data is an empty struct.
-			errors = append(errors, item.Err)
+}
+
+// taskSize estimates the download size of one extracted data item, used for
+// size-based scheduling.
+func taskSize(c *cli.Context, data *extractors.Data) int64 {
+	if streamName := c.String("stream-format"); streamName != "" {
+		if stream, ok := data.Streams[streamName]; ok {
+			return stream.Size
+		}
+	}
+	var maxSize int64
+	for _, stream := range data.Streams {
+		if stream.Size > maxSize {
+			maxSize = stream.Size
+		}
+	}
+	return maxSize
+}
+
+// downloadWithQueue extracts all input URLs, enqueues the extracted items
+// into the download queue manager and runs it with the configured global
+// concurrency limit.
+//
+// Errors are classified into two categories:
+//   - task-level failures: a single URL/item failed (extraction or download).
+//     They are collected and reported per task, and failed download tasks are
+//     automatically re-scheduled by the queue's delayed retry queue.
+//   - system-level failures: the queue itself cannot operate (for example an
+//     invalid --max-concurrent value). They abort the whole run immediately.
+func downloadWithQueue(c *cli.Context, args []string) error {
+	// System-level failure: invalid queue configuration.
+	queueManager, err := NewQueueManager(QueueOptions{
+		MaxConcurrent:   int(c.Uint("max-concurrent")),
+		QueueRetryTimes: int(c.Uint("queue-retry")),
+		RetryDelay:      time.Duration(c.Uint("queue-retry-delay")) * time.Second,
+	})
+	if err != nil {
+		return cli.Exit(fmt.Sprintf("queue manager error: %s", err), 1)
+	}
+
+	// Phase 1: extract all URLs and enqueue the extracted items.
+	// Extraction errors are task-level failures of the corresponding URL.
+	var taskErrors []error
+	priority := c.Int("priority")
+	for _, videoURL := range args {
+		dataList, err := extract(c, videoURL)
+		if err != nil {
+			printTaskError(videoURL, err)
+			taskErrors = append(taskErrors, err)
 			continue
 		}
-		if err = defaultDownloader.Download(item); err != nil {
-			errors = append(errors, err)
+		for _, item := range dataList {
+			if item.Err != nil {
+				// if this error occurs, the preparation step is normal, but the data extraction is wrong.
+				// the data is an empty struct.
+				printTaskError(videoURL, item.Err)
+				taskErrors = append(taskErrors, item.Err)
+				continue
+			}
+			pause := downloader.NewPauseController()
+			queueManager.Enqueue(&Task{
+				URL:        videoURL,
+				Title:      item.Title,
+				Site:       item.Site,
+				Size:       taskSize(c, item),
+				Priority:   priority,
+				Data:       item,
+				Downloader: newDownloader(c, pause),
+				pause:      pause,
+			})
 		}
 	}
-	if len(errors) != 0 {
-		return errors[0]
+
+	if queueManager.Len() == 0 {
+		if len(taskErrors) != 0 {
+			return cli.Exit("", 1)
+		}
+		return nil
+	}
+
+	if !c.Bool("silent") {
+		fmt.Fprintf(
+			color.Output,
+			"Download queue: %s task(s), max concurrent: %s\n",
+			color.CyanString("%d", queueManager.Len()),
+			color.CyanString("%d", int(c.Uint("max-concurrent"))),
+		)
+		go queueCommandListener(queueManager)
+	}
+
+	// Phase 2: run the queue. Finished tasks automatically trigger the
+	// scheduling of the next highest-priority task; failed tasks are
+	// re-scheduled through the delayed retry queue.
+	results := queueManager.Run()
+	sortResultsByID(results)
+	for _, result := range results {
+		if result.Err != nil {
+			// Task-level failure after all queue retries are exhausted.
+			printTaskError(result.Task.URL, result.Err)
+			taskErrors = append(taskErrors, result.Err)
+		}
+	}
+
+	if len(taskErrors) != 0 {
+		return cli.Exit("", 1)
 	}
 	return nil
+}
+
+// queueCommandListener reads simple queue control commands from stdin:
+//
+//	pause <id>   pause a single task
+//	resume <id>  resume a single task
+//	status       print the status of all tasks
+//
+// It exits silently when stdin is closed or not readable.
+func queueCommandListener(queueManager *QueueManager) {
+	scanner := bufio.NewScanner(os.Stdin)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) == 0 {
+			continue
+		}
+		switch fields[0] {
+		case "pause", "resume":
+			if len(fields) != 2 {
+				fmt.Println("usage: pause|resume <task id>")
+				continue
+			}
+			var id int
+			if _, err := fmt.Sscanf(fields[1], "%d", &id); err != nil {
+				fmt.Println("invalid task id")
+				continue
+			}
+			var ok bool
+			if fields[0] == "pause" {
+				ok = queueManager.PauseTask(id)
+			} else {
+				ok = queueManager.ResumeTask(id)
+			}
+			if !ok {
+				fmt.Printf("task %d can not be %sd\n", id, fields[0])
+			}
+		case "status":
+			for _, s := range queueManager.Snapshots() {
+				fmt.Printf("task %d [%s] %s %s\n", s.ID, s.Status, s.Site, s.Title)
+			}
+		}
+	}
 }

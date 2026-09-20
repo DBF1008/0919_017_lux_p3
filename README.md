@@ -38,6 +38,7 @@
   - [Multiple inputs](#multiple-inputs)
   - [Resume a download](#resume-a-download)
   - [Auto retry](#auto-retry)
+  - [Download queue](#download-queue)
   - [Cookies](#cookies)
   - [Proxy](#proxy)
   - [Multi-Thread](#multi-thread)
@@ -317,6 +318,15 @@ A temporary `.download` file is kept in the output directory. If `lux` is ran wi
 
 lux will auto retry when the download failed, you can specify the retry times by `-retry` option (default is 100).
 
+### Download queue
+
+When downloading multiple URLs at once, lux schedules them with a download queue manager instead of downloading them strictly one by one:
+
+* Tasks are scheduled by user-specified priority (`--priority`), then by site type, then by file size (smaller first).
+* `--max-concurrent` limits how many videos are downloaded at the same time globally (default is 3), avoiding exhausting your bandwidth.
+* A failed task is automatically put into a delayed queue and re-scheduled later (`--queue-retry`, `--queue-retry-delay`). This task-level re-scheduling is independent of the per-chunk retry controlled by `-retry`.
+* While the queue is running you can type `pause <id>`, `resume <id>` or `status` on stdin to control individual tasks.
+
 ### Cookies
 
 Cookies can be provided to `lux` with the `-c` option if they are required for accessing the video.
@@ -546,6 +556,14 @@ $ lux -j "https://www.bilibili.com/video/av20203945"
 ```
   -retry int
     	How many times to retry when the download failed (default 10)
+  -max-concurrent int
+    	The maximum number of videos downloaded concurrently (global limit) (default 3)
+  -priority int
+    	User-specified scheduling priority for the input URLs, higher values are downloaded first (default 0)
+  -queue-retry int
+    	How many times a failed task is re-scheduled by the download queue (task-level retry) (default 2)
+  -queue-retry-delay int
+    	Base delay in seconds before a failed task is re-scheduled by the download queue (default 5)
 ```
 
 #### Playlist:
